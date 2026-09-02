@@ -2,23 +2,17 @@ import mongoose from 'mongoose';
 
 const categorySchema = new mongoose.Schema(
   {
-    // Since your events use a numeric categoryId, we keep a custom Number field 
-    // here to make mapping them together incredibly easy without complex SQL joins.
-    categoryId: {
-      type: Number,
-      required: true,
-      unique: true,
-    },
+    // MongoDB's _id (ObjectId) is the category identifier.
+    // Events reference this via ObjectId — no custom Number ID needed.
     name: {
       type: String,
       required: [true, 'Category name is required'],
-      unique: true, // Matches .unique() from your Drizzle setup
+      unique: true,
       trim: true,
     },
   },
   {
-    // Natively handles 'createdAt' and 'updatedAt' timestamps automatically!
-    timestamps: true, 
+    timestamps: true,
   }
 );
 

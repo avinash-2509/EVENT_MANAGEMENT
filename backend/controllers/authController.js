@@ -63,8 +63,8 @@ export const login = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Please provide both username and password' });
     }
 
-    // 2. Find the user by username (password is included automatically now)
-    const user = await User.findOne({ username });
+    
+    const user = await User.findOne({ username }).select('+password');
     if (!user) {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
