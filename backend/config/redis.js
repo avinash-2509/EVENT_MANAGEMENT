@@ -4,9 +4,9 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-let redis;
+let redis = null;
 
-try {
+if (process.env.UPSTASH_REDIS_URL) try {
   // Initialize the ioredis client using your environment variable
   redis = new Redis(process.env.UPSTASH_REDIS_URL);
 

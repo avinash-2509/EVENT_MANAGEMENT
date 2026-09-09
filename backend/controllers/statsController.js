@@ -1,114 +1,24 @@
-import Event from '../models/events.js';      // Adjust paths to your actual Mongoose models
-import Order from '../models/Order.js';
-import Category from '../models/Category.js';
+import Event from '../models/events.js';
+import EventShow from '../models/EventShow.js';
 
-// @desc    Get global summary metrics for the dashboard
-// @route   GET /api/stats/dashboard
 export const getDashboardStats = async (req, res) => {
-  try {
-    const now = new Date();
-
-    // 1. Run count and revenue aggregations concurrently for efficiency
-    const [
-      totalEvents,
-      totalOrders,
-      upcomingEvents,
-      freeEvents,
-      revenueResult
-    ] = await Promise.all([
-      Event.countDocuments({}),
-      Order.countDocuments({}),
-      Event.countDocuments({ startDate: { $gt: now } }),
-      Event.countDocuments({ isFree: true }),
-      Order.aggregate([
-        {
-          $group: {
-            _id: null,
-            // Converts string amounts to numbers on-the-fly to sum up properly
-            total: { $sum: { $toDouble: '$totalAmount' } }
-          }
-        }
-      ])
-    ]);
-
-    // Extract revenue from the aggregation array pipeline safely
-    const totalRevenue = revenueResult.length > 0 ? revenueResult[0].total.toFixed(2) : "0.00";
-
-    const stats = {
-      totalEvents,
-      totalOrders,
-      totalRevenue: String(totalRevenue), // Kept as string to mirror your original schema design
-      upcomingEvents,
-      freeEvents,
-      paidEvents: totalEvents - freeEvents
-    };
-
-    res.json(stats);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+  const eventIds = await Event.find({ organizerId: req.user._id }).distinct('_id');
+  const [totalEvents, publishedEvents, cancelledEvents, totalShows] = await Promise.all([
+    Event.countDocuments({ organizerId: req.user._id }),
+    Event.countDocuments({ organizerId: req.user._id, status: 'published' }),
+    Event.countDocuments({ organizerId: req.user._id, status: 'cancelled' }),
+    EventShow.countDocuments({ eventId: { $in: eventIds } }),
+  ]);
+  return res.json({ data: { totalEvents, publishedEvents, cancelledEvents, totalShows } });
 };
-
-// @desc    Get event counts categorized, sorted from highest to lowest activity
-// @route   GET /api/stats/categories
-// export const getCategoryStats = async (req, res) => {
-//   try {
-//     // Replicates the LEFT JOIN + GROUP BY + ORDER BY SQL block using MongoDB's aggregation pipeline
-//     const categoryStats = await Category.aggregate([
-//       {
-//         $lookup: {
-//           from: 'events',            // Must match your exact MongoDB collection name for Events
-//           localField: '',         // Using MongoDB's standard hex _id field
-//           foreignField: 'categoryId', 
-//           as: 'matchedEvents'
-//         }
-//       },
-//       {
-//         $project: {
-//           _id: 0,                    // Suppresses the default wrapper root ID
-//           categoryId: '$_id',        // Remaps the hex ID field to 'categoryId' for frontend expectation
-//           categoryName: '$name',
-//           eventCount: { $size: '$matchedEvents' } // Counts array elements generated from the lookup
-//         }
-//       },
-//       {
-//         $sort: { eventCount: -1 }    // Sorts descending (highest count first)
-//       }
-//     ]);
-
-//     res.json(categoryStats);
-//   } catch (error) {
-//     res.status(500).json({ error: error.message });
-//   }
-// };
-
 export const getCategoryStats = async (req, res) => {
-  try {
-    // Replicates the LEFT JOIN + GROUP BY + ORDER BY SQL block using MongoDB's aggregation pipeline
-    const categoryStats = await Category.aggregate([
-      {
-        $lookup: {
-          from: 'events',            // Must match your exact MongoDB collection name for Events
-          localField: 'categoryId',  // CHANGED: was '_id' — Event.categoryId is a Number, not an ObjectId
-          foreignField: 'categoryId',
-          as: 'matchedEvents'
-        }
-      },
-      {
-        $project: {
-          _id: 0,                    // Suppresses the default wrapper root ID
-          categoryId: '$categoryId', // CHANGED: was '$_id' — return the actual Number categoryId, not the hex _id
-          categoryName: '$name',
-          eventCount: { $size: '$matchedEvents' } // Counts array elements generated from the lookup
-        }
-      },
-      {
-        $sort: { eventCount: -1 }    // Sorts descending (highest count first)
-      }
-    ]);
-
-    res.json(categoryStats);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+  const rows = await Event.aggregate([
+    { $match: { organizerId: req.user._id } },
+    { $group: { _id: '$categoryId', eventCount: { $sum: 1 } } },
+    { $lookup: { from: 'categories', localField: '_id', foreignField: '_id', as: 'category' } },
+    { $unwind: '$category' },
+    { $project: { _id: 0, categoryId: '$_id', categoryName: '$category.name', eventCount: 1 } },
+    { $sort: { eventCount: -1 } },
+  ]);
+  return res.json({ data: rows });
 };

@@ -1,72 +1,50 @@
-// import express from 'express';
-// // 1. Import ALL of your controller methods
-// import { protect } from '../middleware/authMiddleware.js';
-// import {
-//   getEvents,
-//   createEvent,
-//   getTrendingEvents,
-//   getEventById,
-//   updateEvent,
-//   deleteEvent,
-//   getRelatedEvents
-// } from '../controllers/eventController.js';
-
-// const router = express.Router();
-
-// // 2. Base Collection Routes (Handles: GET /api/events & POST /api/events)
-// router.route('/')
-//   .get(getEvents)
-//   .post(protect,createEvent);
-
-// // 3. Trending Route (Handles: GET /api/events/trending)
-// // NOTE: Place this ABOVE the /:id route so Express doesn't mistake the word "trending" for an ID!
-// router.route('/trending')
-//   .get(getTrendingEvents);
-
-// // 4. Individual Record Routes (Handles: GET, PATCH, and DELETE for /api/events/:id)
-// router.route('/:id')
-//   .get(getEventById)
-//   .patch(protect,updateEvent)
-//   .delete(protect,deleteEvent);
-
-// // 5. Related Items Route (Handles: GET /api/events/:id/related)
-// router.route('/:id/related')
-//   .get(getRelatedEvents);
-
-// export default router;
-
 import express from 'express';
-import { protect } from '../middleware/authMiddleware.js';
-import upload from '../middleware/upload.js'; // 1. Import your clean Multer configuration middleware
 import {
-  getEvents,
+  cancelEvent,
+  cancelShow,
   createEvent,
-  getTrendingEvents,
-  getEventById,
-  updateEvent,
+  createShow,
   deleteEvent,
-  getRelatedEvents
+  getEventById,
+  getEvents,
+  getOrganizerEvents,
+  getRelatedEvents,
+  getShows,
+  getTrendingEvents,
+  publishEvent,
+  updateEvent,
+  updateShow,
 } from '../controllers/eventController.js';
+import { optionalAuth, protect, requireOrganizer } from '../middleware/authMiddleware.js';
+import { isObjectId } from '../utils/validation.js';
 
 const router = express.Router();
 
-// 2. Base Collection Routes (Handles: GET /api/events & POST /api/events)
-router.route('/')
-  .get(getEvents)
-  .post(protect, upload.single('imageUrl'), createEvent); // Added upload.single here
+const validateIdParam = (req, res, next, value) => {
+  if (!isObjectId(value)) {
+    return res.status(400).json({ code: 'INVALID_ID', message: 'Invalid resource ID.' });
+  }
+  return next();
+};
 
-// 3. Trending Route (Handles: GET /api/events/trending)
-router.route('/trending')
-  .get(getTrendingEvents);
+router.param('id', validateIdParam);
+router.param('showId', validateIdParam);
 
-// 4. Individual Record Routes (Handles: GET, PATCH, and DELETE for /api/events/:id)
-router.route('/:id')
-  .get(getEventById)
-  .patch(protect, upload.single('imageUrl'), updateEvent) // Added upload.single here
-  .delete(protect, deleteEvent);
+router.get('/', getEvents);
+router.post('/', protect, requireOrganizer, createEvent);
+router.get('/mine', protect, requireOrganizer, getOrganizerEvents);
+router.get('/trending', getTrendingEvents);
 
-// 5. Related Items Route (Handles: GET /api/events/:id/related)
-router.route('/:id/related')
-  .get(getRelatedEvents);
+router.get('/:id/shows', optionalAuth, getShows);
+router.post('/:id/shows', protect, requireOrganizer, createShow);
+router.patch('/:id/shows/:showId', protect, requireOrganizer, updateShow);
+router.post('/:id/shows/:showId/cancel', protect, requireOrganizer, cancelShow);
+
+router.get('/:id/related', getRelatedEvents);
+router.post('/:id/publish', protect, requireOrganizer, publishEvent);
+router.post('/:id/cancel', protect, requireOrganizer, cancelEvent);
+router.get('/:id', optionalAuth, getEventById);
+router.patch('/:id', protect, requireOrganizer, updateEvent);
+router.delete('/:id', protect, requireOrganizer, deleteEvent);
 
 export default router;

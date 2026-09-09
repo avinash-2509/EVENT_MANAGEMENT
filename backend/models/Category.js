@@ -2,19 +2,11 @@ import mongoose from 'mongoose';
 
 const categorySchema = new mongoose.Schema(
   {
-    // MongoDB's _id (ObjectId) is the category identifier.
-    // Events reference this via ObjectId — no custom Number ID needed.
-    name: {
-      type: String,
-      required: [true, 'Category name is required'],
-      unique: true,
-      trim: true,
-    },
+    name: { type: String, required: [true, 'Category name is required'], unique: true, trim: true, maxlength: 80 },
+    slug: { type: String, required: true, unique: true, lowercase: true, trim: true, maxlength: 80 },
+    isActive: { type: Boolean, default: true },
   },
-  {
-    timestamps: true,
-  }
+  { timestamps: true }
 );
 
-const Category = mongoose.model('Category', categorySchema);
-export default Category;
+export default mongoose.model('Category', categorySchema);

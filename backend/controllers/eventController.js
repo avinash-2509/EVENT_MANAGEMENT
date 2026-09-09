@@ -1,396 +1,353 @@
-
-
+import crypto from 'crypto';
+import mongoose from 'mongoose';
+import Category from '../models/Category.js';
 import Event from '../models/events.js';
-import Order from '../models/Order.js'; 
-import Category from '../models/Category.js'; 
+import EventShow from '../models/EventShow.js';
+import { cleanText, isObjectId, slugify } from '../utils/validation.js';
 
-// Helper to format rows cleanly matching your original UI expectations
-function buildEventRow(event, categoryName = null, ticketsSold = 0) {
-  return {
-    id: event._id, 
-    title: event.title,
-    description: event.description || null,
-    imageUrl: event.imageUrl || null,
-    location: event.location,
-    startDate: event.startDate ? new Date(event.startDate).toISOString() : null,
-    endDate: event.endDate ? new Date(event.endDate).toISOString() : null,
-    price: event.price || null,
-    isFree: event.isFree ?? false,
-    url: event.url || null,
-    categoryId: event.categoryId,
-    organizerName: event.organizerName || null,
-    createdAt: event.createdAt ? new Date(event.createdAt).toISOString() : null,
-    categoryName: categoryName || null,
-    ticketsSold: ticketsSold || 0,
-  };
-}
+const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-// Helper utility to safely invalidate all keys linked to event lists
-async function clearEventsCache(redis) {
+const serializeShow = (show) => ({
+  id: show._id,
+  eventId: show.eventId,
+  startsAt: show.startsAt,
+  endsAt: show.endsAt,
+  pricePaise: show.pricePaise,
+  currency: show.currency,
+  capacity: show.capacity,
+  reservedCount: show.reservedCount,
+  soldCount: show.soldCount,
+  availableCount: Math.max(0, show.capacity - show.reservedCount - show.soldCount),
+  salesOpenAt: show.salesOpenAt,
+  salesCloseAt: show.salesCloseAt,
+  status: show.status,
+});
+
+const serializeEvent = (event, nextShow = null) => ({
+  id: event._id,
+  title: event.title,
+  slug: event.slug,
+  description: event.description,
+  imageUrl: event.imageUrl,
+  venue: event.venue,
+  timezone: event.timezone,
+  status: event.status,
+  url: event.url,
+  category: event.categoryId && event.categoryId.name ? {
+    id: event.categoryId._id,
+    name: event.categoryId.name,
+    slug: event.categoryId.slug,
+  } : { id: event.categoryId },
+  organizer: event.organizerId && event.organizerId.username ? {
+    id: event.organizerId._id,
+    username: event.organizerId.username,
+  } : { id: event.organizerId },
+  nextShow: nextShow ? serializeShow(nextShow) : null,
+  publishedAt: event.publishedAt,
+  cancelledAt: event.cancelledAt,
+  createdAt: event.createdAt,
+  updatedAt: event.updatedAt,
+});
+
+const validateTimezone = (timezone) => {
   try {
-    // Find all cache keys that match our event namespace pattern
-    const keys = await redis.keys('cache:events:*');
-    if (keys.length > 0) {
-      await redis.del(...keys);
-      console.log(`Summary: Cleared ${keys.length} event cache keys due to database alteration`);
-    }
-  } catch (err) {
-    console.error('Failed to sweep Redis event cache keys:', err);
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format();
+    return true;
+  } catch {
+    return false;
   }
-}
+};
 
-// @desc    Get all events with Text Search, Category filters, and Pagination
-// @route   GET /api/events
+const makeSlug = (title) => `${slugify(title)}-${crypto.randomBytes(3).toString('hex')}`;
+
+const validateShowInput = (body, current = {}) => {
+  const startsAt = body.startsAt === undefined ? current.startsAt : new Date(body.startsAt);
+  const endsAt = body.endsAt === undefined ? current.endsAt : new Date(body.endsAt);
+  const pricePaise = body.pricePaise === undefined ? current.pricePaise : Number(body.pricePaise);
+  const capacity = body.capacity === undefined ? current.capacity : Number(body.capacity);
+  const salesOpenAt = body.salesOpenAt === undefined
+    ? current.salesOpenAt
+    : body.salesOpenAt ? new Date(body.salesOpenAt) : null;
+  const salesCloseAt = body.salesCloseAt === undefined
+    ? current.salesCloseAt
+    : body.salesCloseAt ? new Date(body.salesCloseAt) : null;
+
+  if (!startsAt || Number.isNaN(startsAt.getTime()) || !endsAt || Number.isNaN(endsAt.getTime()) || endsAt <= startsAt) {
+    return { error: 'Show end must be after its start.' };
+  }
+  if (!Number.isInteger(pricePaise) || pricePaise < 1) return { error: 'pricePaise must be a positive integer.' };
+  if (!Number.isInteger(capacity) || capacity < 1) return { error: 'capacity must be a positive integer.' };
+  if (salesOpenAt && Number.isNaN(salesOpenAt.getTime())) return { error: 'salesOpenAt is invalid.' };
+  if (salesCloseAt && Number.isNaN(salesCloseAt.getTime())) return { error: 'salesCloseAt is invalid.' };
+  if (salesOpenAt && salesCloseAt && salesCloseAt <= salesOpenAt) return { error: 'Sales close must be after sales open.' };
+  if (salesCloseAt && salesCloseAt > startsAt) return { error: 'Sales must close no later than the show start.' };
+
+  return { value: { startsAt, endsAt, pricePaise, capacity, salesOpenAt, salesCloseAt } };
+};
+
+const findOwnedEvent = (eventId, userId) => Event.findOne({ _id: eventId, organizerId: userId });
+
 export const getEvents = async (req, res) => {
   try {
-    const { redis } = req;
-    const { search = '', categoryId = '', limit = 20, offset = 0 } = req.query;
-    console.log("=== DEBUG GET EVENTS ===");
-    console.log("Raw URL Query params:", req.query);
-    console.log("Extracted categoryId:", categoryId);
-    // Generate a unique cache key based on query filters to avoid data leakage across requests
-    const cacheKey = `cache:events:all:s_${search}:c_${categoryId}:l_${limit}:o_${offset}`;
-    
-    let cachedData = null;
-    try {
-      cachedData = await redis.get(cacheKey);
-    } catch (redisErr) {
-      console.error('Redis GET failed (falling back to DB):', redisErr.message);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 50);
+    const offset = Math.max(Number(req.query.offset) || 0, 0);
+    const filter = { status: 'published' };
+
+    if (req.query.search) {
+      const search = new RegExp(escapeRegex(String(req.query.search).trim().slice(0, 100)), 'i');
+      filter.$or = [{ title: search }, { venue: search }, { description: search }];
     }
 
-    if (cachedData) {
-      console.log('Serving paginated events from Upstash Redis');
-      return res.json(JSON.parse(cachedData));
+    if (req.query.category) {
+      const category = isObjectId(req.query.category)
+        ? await Category.findOne({ _id: req.query.category, isActive: true })
+        : await Category.findOne({ slug: String(req.query.category).toLowerCase(), isActive: true });
+      if (!category) return res.json({ data: [], meta: { total: 0, limit, offset } });
+      filter.categoryId = category._id;
     }
 
-    let queryFilter = {};
-    if (search) {
-      queryFilter.$or = [
-        { title: { $regex: search, $options: 'i' } },
-        { location: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } },
-      ];
-    }
-
-    if (categoryId) {
-      // If it's a number string (e.g. "1"), convert it directly
-      if (!isNaN(categoryId)) {
-        queryFilter.categoryId = Number(categoryId);
-      } else {
-        // If it's text (e.g. "music"), find the Category document via a case-insensitive regex match
-        const categoryDoc = await Category.findOne({ 
-          name: { $regex: new RegExp(`^${categoryId}$`, 'i') } 
-        }).lean();
-        
-        if (categoryDoc) {
-          queryFilter.categoryId = categoryDoc.categoryId;
-        } else {
-          // If the text category doesn't exist at all, force the query to return zero matches safely
-          queryFilter.categoryId = -1; 
-        }
-      }
-    }
-
-    console.time("eventsQuery");
-    const allEvents = await Event.find(queryFilter).sort({ startDate: 1 }).lean();
-    console.timeEnd("eventsQuery");
-
-    const total = allEvents.length;
-    const slicedEvents = allEvents.slice(Number(offset), Number(offset) + Number(limit));
-
-    const formattedEvents = await Promise.all(
-      slicedEvents.map(async (e) => {
-        const categoryDoc = await Category.findOne({ categoryId: e.categoryId }).lean();
-        const orders = await Order.find({ eventId: e._id }).lean();
-        const totalTickets = orders.reduce((sum, order) => sum + (order.quantity || 0), 0);
-        return buildEventRow(e, categoryDoc ? categoryDoc.name : null, totalTickets);
-      })
-    );
-
-    const responsePayload = { events: formattedEvents, total };
-
-    // Cache the query structure for 5 minutes (300s) to keep high-speed pagination snappy
-    try {
-      await redis.set(cacheKey, JSON.stringify(responsePayload), 'EX', 300);
-    } catch (redisErr) {
-      console.error('Redis SET failed:', redisErr.message);
-    }
-
-    return res.json(responsePayload);
-  } catch (error) {
-    return res.status(400).json({ error: error.message });
-  }
-};
-
-// @desc    Create a new event
-// @route   POST /api/events
-// @access  Private
-export const createEvent = async (req, res) => {
-  try {
-    const { redis } = req;
-    const { startDate, endDate, ...rest } = req.body;
-
-    // Direct drop-in: Check if Multer intercepted an uploaded file and assigned a Cloudinary link
-    const imageUrl = req.file ? req.file.path : (rest.imageUrl || '');
-
-    const event = await Event.create({
-      ...rest,
-      imageUrl, // Plug the Cloudinary link straight into your pristine model format
-      startDate: new Date(startDate),
-      endDate: endDate ? new Date(endDate) : null,
-      user: req.user.id 
-    });
-
-    const categoryDoc = await Category.findOne({ categoryId: event.categoryId }).lean();
-
-    // Invalidate caches to show the new event on dashboards instantly
-    // (clearEventsCache handles its own Redis errors)
-    await clearEventsCache(redis);
-
-    return res.status(201).json(buildEventRow(event.toObject(), categoryDoc ? categoryDoc.name : null, 0));
-  } catch (error) {
-    return res.status(400).json({ error: error.message });
-  }
-};
-
-// @desc    Get trending events based on ticket sales quantity
-// @route   GET /api/events/trending
-export const getTrendingEvents = async (req, res) => {
-  try {
-    const { redis } = req;
-    const cacheKey = 'cache:events:trending';
-
-    let cachedTrending = null;
-    try {
-      cachedTrending = await redis.get(cacheKey);
-    } catch (redisErr) {
-      console.error('Redis GET failed (falling back to DB):', redisErr.message);
-    }
-    
-    if (cachedTrending) {
-      console.log('Serving trending events from Upstash Redis');
-      return res.json(JSON.parse(cachedTrending));
-    }
-
-    const topOrders = await Order.aggregate([
-      { $group: { _id: "$eventId", ticketsSold: { $sum: "$quantity" } } },
-      { $sort: { ticketsSold: -1 } },
-      { $limit: 6 }
+    const [events, total] = await Promise.all([
+      Event.find(filter)
+        .sort({ publishedAt: -1, createdAt: -1 })
+        .skip(offset)
+        .limit(limit)
+        .populate('categoryId', 'name slug')
+        .populate('organizerId', 'username')
+        .lean(),
+      Event.countDocuments(filter),
     ]);
 
-    if (topOrders.length === 0) {
-      const recent = await Event.find().sort({ createdAt: 1 }).limit(6).lean();
-      
-      const formattedRecent = await Promise.all(
-        recent.map(async (e) => {
-          const categoryDoc = await Category.findOne({ categoryId: e.categoryId }).lean();
-          return buildEventRow(e, categoryDoc ? categoryDoc.name : null, 0);
-        })
-      );
-
-      try {
-        await redis.set(cacheKey, JSON.stringify(formattedRecent), 'EX', 600); // Cache for 10 mins
-      } catch (redisErr) {
-        console.error('Redis SET failed:', redisErr.message);
-      }
-      
-      return res.json(formattedRecent);
+    const eventIds = events.map((event) => event._id);
+    const shows = await EventShow.find({
+      eventId: { $in: eventIds },
+      status: 'scheduled',
+      startsAt: { $gt: new Date() },
+    }).sort({ startsAt: 1 }).lean();
+    const nextByEvent = new Map();
+    for (const show of shows) {
+      const key = String(show.eventId);
+      if (!nextByEvent.has(key)) nextByEvent.set(key, show);
     }
 
-    const trendingEvents = await Promise.all(
-      topOrders.map(async (item) => {
-        const eventDoc = await Event.findById(item._id).lean();
-        if (!eventDoc) return null;
-        const categoryDoc = await Category.findOne({ categoryId: eventDoc.categoryId }).lean();
-        return buildEventRow(eventDoc, categoryDoc ? categoryDoc.name : null, item.ticketsSold);
-      })
-    );
-
-    const result = trendingEvents.filter(e => e !== null);
-    
-    try {
-      await redis.set(cacheKey, JSON.stringify(result), 'EX', 600);
-    } catch (redisErr) {
-      console.error('Redis SET failed:', redisErr.message);
-    }
-
-    return res.json(result);
-  } catch (error) {
-    return res.status(500).json({ error: error.message });
+    return res.json({
+      data: events.map((event) => serializeEvent(event, nextByEvent.get(String(event._id)))),
+      meta: { total, limit, offset },
+    });
+  } catch {
+    return res.status(500).json({ code: 'EVENT_LIST_FAILED', message: 'Unable to load events.' });
   }
 };
 
-// @desc    Get a single event by ID
-// @route   GET /api/events/:id
+export const getTrendingEvents = async (_req, res) => {
+  const events = await Event.find({ status: 'published' })
+    .sort({ publishedAt: -1 })
+    .limit(6)
+    .populate('categoryId', 'name slug')
+    .populate('organizerId', 'username')
+    .lean();
+  return res.json({ data: events.map((event) => serializeEvent(event)) });
+};
+
+export const getOrganizerEvents = async (req, res) => {
+  const events = await Event.find({ organizerId: req.user._id })
+    .sort({ createdAt: -1 })
+    .populate('categoryId', 'name slug')
+    .lean();
+  return res.json({ data: events.map((event) => serializeEvent(event)) });
+};
+
 export const getEventById = async (req, res) => {
+  if (!isObjectId(req.params.id)) return res.status(400).json({ code: 'INVALID_ID', message: 'Invalid event ID.' });
+  const event = await Event.findById(req.params.id)
+    .populate('categoryId', 'name slug')
+    .populate('organizerId', 'username')
+    .lean();
+  if (!event) return res.status(404).json({ code: 'NOT_FOUND', message: 'Event not found.' });
+
+  const isOwner = req.user?.role === 'organizer' && String(event.organizerId?._id) === String(req.user._id);
+  if (event.status !== 'published' && !isOwner) {
+    return res.status(404).json({ code: 'NOT_FOUND', message: 'Event not found.' });
+  }
+  return res.json({ data: serializeEvent(event) });
+};
+
+export const createEvent = async (req, res) => {
   try {
-    const { redis } = req;
-    const cacheKey = `cache:events:single:${req.params.id}`;
-
-    let cachedEvent = null;
-    try {
-      cachedEvent = await redis.get(cacheKey);
-    } catch (redisErr) {
-      console.error('Redis GET failed (falling back to DB):', redisErr.message);
+    const title = cleanText(req.body.title, 160);
+    const venue = cleanText(req.body.venue, 300);
+    const timezone = cleanText(req.body.timezone || 'Asia/Kolkata', 100);
+    if (!title || !venue || !isObjectId(req.body.categoryId) || !validateTimezone(timezone)) {
+      return res.status(400).json({ code: 'INVALID_EVENT', message: 'title, venue, timezone and categoryId are required.' });
     }
+    const category = await Category.findOne({ _id: req.body.categoryId, isActive: true });
+    if (!category) return res.status(400).json({ code: 'INVALID_CATEGORY', message: 'Select an active category.' });
 
-    if (cachedEvent) {
-      console.log(`Serving event details for ID ${req.params.id} from Upstash Redis`);
-      return res.json(JSON.parse(cachedEvent));
-    }
-
-    const row = await Event.findById(req.params.id).lean();
-    if (!row) {
-      return res.status(404).json({ error: "Event not found" });
-    }
-
-    const categoryDoc = await Category.findOne({ categoryId: row.categoryId }).lean();
-    const orders = await Order.find({ eventId: row._id }).lean();
-    const totalTickets = orders.reduce((sum, order) => sum + (order.quantity || 0), 0);
-
-    const formattedEvent = buildEventRow(row, categoryDoc ? categoryDoc.name : null, totalTickets);
-    
-    try {
-      await redis.set(cacheKey, JSON.stringify(formattedEvent), 'EX', 1800); // Cache individual event for 30 mins
-    } catch (redisErr) {
-      console.error('Redis SET failed:', redisErr.message);
-    }
-
-    return res.json(formattedEvent);
+    const event = await Event.create({
+      organizerId: req.user._id,
+      categoryId: category._id,
+      title,
+      slug: makeSlug(title),
+      description: cleanText(req.body.description, 10000),
+      imageUrl: cleanText(req.body.imageUrl, 2000),
+      venue,
+      timezone,
+      url: cleanText(req.body.url, 2000),
+      status: 'draft',
+    });
+    await event.populate([{ path: 'categoryId', select: 'name slug' }, { path: 'organizerId', select: 'username' }]);
+    return res.status(201).json({ data: serializeEvent(event.toObject()) });
   } catch (error) {
-    return res.status(400).json({ error: error.message });
+    return res.status(400).json({ code: 'EVENT_CREATE_FAILED', message: error.message || 'Unable to create event.' });
   }
 };
 
-// @desc    Update an event field properties path natively
-// @route   PATCH /api/events/:id
-// @access  Private
 export const updateEvent = async (req, res) => {
-  try {
-    const { redis } = req;
-    const { startDate, endDate, ...rest } = req.body;
-    
-    const existingEvent = await Event.findById(req.params.id);
-    if (!existingEvent) {
-      return res.status(404).json({ error: "Event not found" });
+  if (!isObjectId(req.params.id)) return res.status(400).json({ code: 'INVALID_ID', message: 'Invalid event ID.' });
+  const event = await findOwnedEvent(req.params.id, req.user._id);
+  if (!event) return res.status(404).json({ code: 'NOT_FOUND', message: 'Event not found.' });
+  if (event.status === 'cancelled') return res.status(409).json({ code: 'EVENT_CANCELLED', message: 'Cancelled events cannot be edited.' });
+
+  if (req.body.categoryId !== undefined) {
+    if (!isObjectId(req.body.categoryId) || !(await Category.exists({ _id: req.body.categoryId, isActive: true }))) {
+      return res.status(400).json({ code: 'INVALID_CATEGORY', message: 'Select an active category.' });
     }
-
-    if (!existingEvent.user || existingEvent.user.toString() !== req.user.id) {
-      return res.status(403).json({ error: "User not authorized to update this event" });
-    }
-
-    const updateData = { ...rest };
-    if (startDate) updateData.startDate = new Date(startDate);
-    if (endDate) updateData.endDate = new Date(endDate);
-    
-    // Direct drop-in: Update imageUrl configuration only if a new file path is coming through Multer
-    if (req.file) {
-      updateData.imageUrl = req.file.path;
-    }
-
-    const event = await Event.findByIdAndUpdate(
-      req.params.id,
-      { $set: updateData },
-      { returnDocument: 'after', runValidators: true }
-    ).lean();
-
-    const categoryDoc = await Category.findOne({ categoryId: event.categoryId }).lean();
-    const orders = await Order.find({ eventId: event._id }).lean();
-    const totalTickets = orders.reduce((sum, order) => sum + (order.quantity || 0), 0);
-
-    const updatedFormattedEvent = buildEventRow(event, categoryDoc ? categoryDoc.name : null, totalTickets);
-
-    // Evict list aggregations and specific details cache to flush out stale values
-    await clearEventsCache(redis);
-    
-    try {
-      await redis.del(`cache:events:single:${req.params.id}`);
-    } catch (redisErr) {
-      console.error('Redis DEL failed:', redisErr.message);
-    }
-
-    return res.json(updatedFormattedEvent);
-  } catch (error) {
-    return res.status(400).json({ error: error.message });
+    event.categoryId = req.body.categoryId;
   }
+  if (req.body.title !== undefined) event.title = cleanText(req.body.title, 160);
+  if (req.body.description !== undefined) event.description = cleanText(req.body.description, 10000);
+  if (req.body.venue !== undefined) event.venue = cleanText(req.body.venue, 300);
+  if (req.body.url !== undefined) event.url = cleanText(req.body.url, 2000);
+  if (req.body.timezone !== undefined) {
+    if (!validateTimezone(req.body.timezone)) return res.status(400).json({ code: 'INVALID_TIMEZONE', message: 'Invalid timezone.' });
+    event.timezone = cleanText(req.body.timezone, 100);
+  }
+  if (req.body.imageUrl !== undefined) event.imageUrl = cleanText(req.body.imageUrl, 2000);
+  await event.save();
+  await event.populate([{ path: 'categoryId', select: 'name slug' }, { path: 'organizerId', select: 'username' }]);
+  return res.json({ data: serializeEvent(event.toObject()) });
 };
 
-// @desc    Delete an event document file securely
-// @route   DELETE /api/events/:id
-// @access  Private
+export const publishEvent = async (req, res) => {
+  const event = await findOwnedEvent(req.params.id, req.user._id);
+  if (!event) return res.status(404).json({ code: 'NOT_FOUND', message: 'Event not found.' });
+  if (event.status !== 'draft') return res.status(409).json({ code: 'INVALID_STATE', message: 'Only draft events can be published.' });
+  const hasShow = await EventShow.exists({ eventId: event._id, status: 'scheduled', startsAt: { $gt: new Date() } });
+  if (!hasShow) return res.status(409).json({ code: 'SHOW_REQUIRED', message: 'Add a future show before publishing.' });
+  event.status = 'published';
+  event.publishedAt = new Date();
+  await event.save();
+  return res.json({ data: serializeEvent(event.toObject()) });
+};
+
+export const cancelEvent = async (req, res) => {
+  const event = await findOwnedEvent(req.params.id, req.user._id);
+  if (!event) return res.status(404).json({ code: 'NOT_FOUND', message: 'Event not found.' });
+  if (event.status === 'cancelled') return res.json({ data: serializeEvent(event.toObject()) });
+  let hasAllocatedInventory = false;
+  await mongoose.connection.transaction(async (session) => {
+    hasAllocatedInventory = Boolean(await EventShow.exists({
+      eventId: event._id,
+      $or: [{ reservedCount: { $gt: 0 } }, { soldCount: { $gt: 0 } }],
+    }).session(session));
+    if (hasAllocatedInventory) return;
+    await Event.updateOne({ _id: event._id }, { $set: { status: 'cancelled', cancelledAt: new Date() } }, { session });
+    await EventShow.updateMany({ eventId: event._id }, { $set: { status: 'cancelled' } }, { session });
+  });
+  if (hasAllocatedInventory) {
+    return res.status(409).json({ code: 'EVENT_HAS_BOOKINGS', message: 'Events with reservations or sold tickets cannot be cancelled.' });
+  }
+  const updated = await Event.findById(event._id).lean();
+  return res.json({ data: serializeEvent(updated) });
+};
+
 export const deleteEvent = async (req, res) => {
-  try {
-    const { redis } = req;
-    const existingEvent = await Event.findById(req.params.id);
-    if (!existingEvent) {
-      return res.status(404).json({ error: "Event not found" });
-    }
-
-    if (!existingEvent.user || existingEvent.user.toString() !== req.user.id) {
-      return res.status(403).json({ error: "User not authorized to delete this event" });
-    }
-
-    await Event.findByIdAndDelete(req.params.id);
-
-    // Evict all dependent caches
-    await clearEventsCache(redis);
-    
-    try {
-      await redis.del(`cache:events:single:${req.params.id}`);
-    } catch (redisErr) {
-      console.error('Redis DEL failed:', redisErr.message);
-    }
-
-    return res.sendStatus(204); 
-  } catch (error) {
-    return res.status(400).json({ error: error.message });
-  }
+  const event = await findOwnedEvent(req.params.id, req.user._id);
+  if (!event) return res.status(404).json({ code: 'NOT_FOUND', message: 'Event not found.' });
+  if (event.status !== 'draft') return res.status(409).json({ code: 'DRAFT_ONLY', message: 'Only draft events can be deleted.' });
+  await mongoose.connection.transaction(async (session) => {
+    await EventShow.deleteMany({ eventId: event._id }, { session });
+    await Event.deleteOne({ _id: event._id }, { session });
+  });
+  return res.sendStatus(204);
 };
 
-// @desc    List related events inside matching category scopes, excluding source file
-// @route   GET /api/events/:id/related
 export const getRelatedEvents = async (req, res) => {
-  try {
-    const { redis } = req;
-    const cacheKey = `cache:events:related:${req.params.id}`;
+  const source = await Event.findOne({ _id: req.params.id, status: 'published' }).lean();
+  if (!source) return res.json({ data: [] });
+  const events = await Event.find({ _id: { $ne: source._id }, categoryId: source.categoryId, status: 'published' })
+    .limit(4).populate('categoryId', 'name slug').populate('organizerId', 'username').lean();
+  return res.json({ data: events.map((event) => serializeEvent(event)) });
+};
 
-    let cachedRelated = null;
-    try {
-      cachedRelated = await redis.get(cacheKey);
-    } catch (redisErr) {
-      console.error('Redis GET failed (falling back to DB):', redisErr.message);
-    }
+export const getShows = async (req, res) => {
+  const event = await Event.findById(req.params.id).lean();
+  if (!event) return res.status(404).json({ code: 'NOT_FOUND', message: 'Event not found.' });
+  const isOwner = req.user?.role === 'organizer' && String(event.organizerId) === String(req.user._id);
+  if (event.status !== 'published' && !isOwner) return res.status(404).json({ code: 'NOT_FOUND', message: 'Event not found.' });
+  const filter = { eventId: event._id };
+  if (!isOwner) filter.status = 'scheduled';
+  const shows = await EventShow.find(filter).sort({ startsAt: 1 }).lean();
+  return res.json({ data: shows.map(serializeShow) });
+};
 
-    if (cachedRelated) {
-      console.log(`Serving related events for ID ${req.params.id} from Upstash Redis`);
-      return res.json(JSON.parse(cachedRelated));
-    }
+export const createShow = async (req, res) => {
+  const event = await findOwnedEvent(req.params.id, req.user._id);
+  if (!event) return res.status(404).json({ code: 'NOT_FOUND', message: 'Event not found.' });
+  if (event.status === 'cancelled') return res.status(409).json({ code: 'EVENT_CANCELLED', message: 'Cannot add shows to a cancelled event.' });
 
-    const sourceEvent = await Event.findById(req.params.id).lean();
-    if (!sourceEvent) {
-      return res.json([]);
-    }
+  const parsed = validateShowInput(req.body);
+  if (parsed.error) return res.status(400).json({ code: 'INVALID_SHOW', message: parsed.error });
+  if (parsed.value.startsAt <= new Date()) return res.status(400).json({ code: 'INVALID_SHOW', message: 'Show must start in the future.' });
 
-    const related = await Event.find({
-      categoryId: sourceEvent.categoryId,
-      _id: { $ne: sourceEvent._id }
-    }).limit(4).lean();
+  const show = await EventShow.create({ eventId: event._id, ...parsed.value });
+  return res.status(201).json({ data: serializeShow(show.toObject()) });
+};
 
-    const formattedRelated = await Promise.all(
-      related.map(async (e) => {
-        const categoryDoc = await Category.findOne({ categoryId: e.categoryId }).lean();
-        return buildEventRow(e, categoryDoc ? categoryDoc.name : null, 0);
-      })
-    );
-
-    try {
-      await redis.set(cacheKey, JSON.stringify(formattedRelated), 'EX', 1800);
-    } catch (redisErr) {
-      console.error('Redis SET failed:', redisErr.message);
-    }
-
-    return res.json(formattedRelated);
-  } catch (error) {
-    return res.status(400).json({ error: error.message });
+export const updateShow = async (req, res) => {
+  const event = await findOwnedEvent(req.params.id, req.user._id);
+  if (!event) return res.status(404).json({ code: 'NOT_FOUND', message: 'Event not found.' });
+  const show = await EventShow.findOne({ _id: req.params.showId, eventId: event._id });
+  if (!show) return res.status(404).json({ code: 'NOT_FOUND', message: 'Show not found.' });
+  if (show.status === 'cancelled') return res.status(409).json({ code: 'SHOW_CANCELLED', message: 'Cancelled shows cannot be edited.' });
+  const parsed = validateShowInput(req.body, show);
+  if (parsed.error) return res.status(400).json({ code: 'INVALID_SHOW', message: parsed.error });
+  const filter = {
+    _id: show._id,
+    eventId: event._id,
+    status: 'scheduled',
+    $expr: { $lte: [{ $add: ['$reservedCount', '$soldCount'] }, parsed.value.capacity] },
+  };
+  if (req.body.startsAt !== undefined || req.body.endsAt !== undefined) {
+    filter.reservedCount = 0;
+    filter.soldCount = 0;
   }
+  const updated = await EventShow.findOneAndUpdate(
+    filter,
+    { $set: parsed.value },
+    { returnDocument: 'after', runValidators: true }
+  );
+  if (!updated) {
+    return res.status(409).json({
+      code: 'SHOW_HAS_BOOKINGS',
+      message: 'The requested change conflicts with allocated ticket inventory.',
+    });
+  }
+  return res.json({ data: serializeShow(updated.toObject()) });
+};
+
+export const cancelShow = async (req, res) => {
+  const event = await findOwnedEvent(req.params.id, req.user._id);
+  if (!event) return res.status(404).json({ code: 'NOT_FOUND', message: 'Event not found.' });
+  const existing = await EventShow.findOne({ _id: req.params.showId, eventId: event._id });
+  if (!existing) return res.status(404).json({ code: 'NOT_FOUND', message: 'Show not found.' });
+  if (existing.reservedCount + existing.soldCount > 0) {
+    return res.status(409).json({ code: 'SHOW_HAS_BOOKINGS', message: 'Shows with reservations or sold tickets cannot be cancelled.' });
+  }
+  const show = await EventShow.findOneAndUpdate(
+    { _id: req.params.showId, eventId: event._id, reservedCount: 0, soldCount: 0 },
+    { $set: { status: 'cancelled' } },
+    { returnDocument: 'after' }
+  );
+  if (!show) return res.status(404).json({ code: 'NOT_FOUND', message: 'Show not found.' });
+  return res.json({ data: serializeShow(show.toObject()) });
 };
